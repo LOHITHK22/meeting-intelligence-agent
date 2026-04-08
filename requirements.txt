@@ -16,8 +16,11 @@ langchain-openai==0.1.8
 langchain-community==0.2.5
 
 # ── Vector memory (Phase 2) ───────────────────────────────────────────────────
-faiss-cpu==1.8.0            # use faiss-gpu if you have a CUDA GPU
+faiss-cpu==1.8.0
 numpy==1.26.4
+
+# ── Structured extraction (Phase 3) ──────────────────────────────────────────
+# No new dependencies — uses openai + pydantic already installed above
 
 # ── Dev / testing ─────────────────────────────────────────────────────────────
 httpx==0.27.0

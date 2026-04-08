@@ -1,6 +1,6 @@
 """
-AI Meeting Intelligence Agent — Phase 2
-FastAPI app: audio upload + Whisper transcription + LangChain agent + FAISS RAG
+AI Meeting Intelligence Agent — Phase 3
+FastAPI app: upload → transcribe → index → extract structured insights → chat
 """
 
 import os
@@ -13,24 +13,23 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from transcription_service import transcribe_audio, TranscriptResult
-from memory_service import index_meeting
-from agent_service import chat
+from transcription_service  import transcribe_audio, TranscriptResult
+from memory_service         import index_meeting
+from agent_service          import chat
+from extraction_service     import extract_meeting_insights
+from schemas                import MeetingExtraction
 
-# ── App setup ────────────────────────────────────────────────────────────────
+# ── App setup ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Meeting Intelligence Agent",
-    description="Upload meeting audio → transcribe → chat with your meeting using AI",
-    version="2.0.0",
+    description="Upload → transcribe → extract insights → chat with your meeting",
+    version="3.0.0",
 )
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-
 ALLOWED_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".webm", ".ogg"}
-
-# ── In-memory store (swap for PostgreSQL in Phase 3+) ────────────────────────
 
 meeting_store: dict[str, dict] = {}
 
@@ -39,32 +38,32 @@ meeting_store: dict[str, dict] = {}
 
 class MeetingUploadResponse(BaseModel):
     meeting_id: str
-    filename: str
-    status: str
-    message: str
+    filename:   str
+    status:     str
+    message:    str
 
 
 class MeetingTranscriptResponse(BaseModel):
-    meeting_id: str
+    meeting_id:       str
     duration_seconds: float
-    language: str
-    speakers: list[str]
-    segments: list[dict]
-    full_transcript: str
-    word_count: int
-    created_at: str
+    language:         str
+    speakers:         list[str]
+    segments:         list[dict]
+    full_transcript:  str
+    word_count:       int
+    created_at:       str
 
 
 class ChatRequest(BaseModel):
-    message: str
-    session_id: str | None = None   # optional — generated server-side if omitted
+    message:    str
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     meeting_id: str
     session_id: str
-    message: str
-    response: str
+    message:    str
+    response:   str
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -88,10 +87,11 @@ def save_upload(file: UploadFile, meeting_id: str) -> Path:
 
 async def process_meeting(meeting_id: str, file_path: Path) -> None:
     """
-    Background task — three steps:
-      1. Transcribe with Whisper + pyannote
-      2. Store results
-      3. Embed + index into FAISS  (new in Phase 2)
+    Full processing pipeline — 4 steps:
+      1. Transcribe  (Whisper + pyannote)
+      2. Store raw transcript
+      3. Index into FAISS
+      4. Extract structured insights  (new in Phase 3)
     """
     try:
         meeting_store[meeting_id]["status"] = "processing"
@@ -99,7 +99,6 @@ async def process_meeting(meeting_id: str, file_path: Path) -> None:
         # Step 1: Transcribe
         result: TranscriptResult = await transcribe_audio(file_path)
 
-        # Step 2: Store
         meeting_store[meeting_id].update({
             "status":           "indexing",
             "duration_seconds": result.duration_seconds,
@@ -111,30 +110,33 @@ async def process_meeting(meeting_id: str, file_path: Path) -> None:
             "created_at":       datetime.utcnow().isoformat(),
         })
 
-        # Step 3: Embed + index into FAISS
+        # Step 2: Index into FAISS
         index_meeting(meeting_id, result.segments)
 
-        meeting_store[meeting_id]["status"] = "completed"
+        # Step 3: Extract structured insights
+        meeting_store[meeting_id]["status"] = "extracting"
+
+        extraction: MeetingExtraction = await extract_meeting_insights(
+            meeting_id=meeting_id,
+            transcript=result.full_transcript,
+            speakers=result.speakers,
+        )
+
+        meeting_store[meeting_id]["extraction"]      = extraction.model_dump()
+        meeting_store[meeting_id]["markdown_report"] = extraction.to_markdown()
+        meeting_store[meeting_id]["status"]          = "completed"
 
     except Exception as exc:
         meeting_store[meeting_id]["status"] = "failed"
-        meeting_store[meeting_id]["error"] = str(exc)
+        meeting_store[meeting_id]["error"]  = str(exc)
         raise
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.post(
-    "/meetings/upload",
-    response_model=MeetingUploadResponse,
-    status_code=202,
-    tags=["meetings"],
-)
-async def upload_meeting(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-):
-    """Upload a meeting recording. Returns a meeting_id for polling."""
+@app.post("/meetings/upload", response_model=MeetingUploadResponse, status_code=202, tags=["meetings"])
+async def upload_meeting(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Upload a meeting recording. Processing runs in the background."""
     validate_file(file)
     meeting_id = str(uuid.uuid4())
     file_path  = save_upload(file, meeting_id)
@@ -152,60 +154,68 @@ async def upload_meeting(
         meeting_id=meeting_id,
         filename=file.filename,
         status="queued",
-        message="Upload received. Transcription + indexing running in background.",
+        message="Upload received. Processing pipeline started.",
     )
 
 
-@app.get(
-    "/meetings/{meeting_id}/transcript",
-    response_model=MeetingTranscriptResponse,
-    tags=["meetings"],
-)
+@app.get("/meetings/{meeting_id}/transcript", response_model=MeetingTranscriptResponse, tags=["meetings"])
 async def get_transcript(meeting_id: str):
-    """Retrieve the transcript for a completed meeting."""
+    """Get the raw transcript for a meeting."""
     record = meeting_store.get(meeting_id)
     if not record:
         raise HTTPException(status_code=404, detail="Meeting not found.")
-
     status = record["status"]
-
-    if status in ("queued", "processing", "indexing"):
-        return JSONResponse(
-            status_code=202,
-            content={"meeting_id": meeting_id, "status": status, "message": f"Meeting is {status}..."}
-        )
-    if status == "failed":
-        raise HTTPException(status_code=500, detail=f"Processing failed: {record.get('error')}")
-
+    if status != "completed":
+        return JSONResponse(status_code=202, content={"meeting_id": meeting_id, "status": status})
     return MeetingTranscriptResponse(**{k: record[k] for k in MeetingTranscriptResponse.model_fields})
 
 
-@app.post(
-    "/meetings/{meeting_id}/chat",
-    response_model=ChatResponse,
-    tags=["chat"],
-)
-async def chat_with_meeting(meeting_id: str, request: ChatRequest):
+@app.get("/meetings/{meeting_id}/insights", tags=["insights"])
+async def get_insights(meeting_id: str, format: str = "json"):
     """
-    Chat with your meeting using natural language.
-
-    Example questions:
-    - "Who owns the API redesign task?"
-    - "What did Sarah say about the deadline?"
-    - "Summarise the key decisions made"
-    - "Has this topic come up in past meetings?"
+    Get structured insights from the meeting.
+    ?format=json (default) or ?format=markdown
     """
     record = meeting_store.get(meeting_id)
     if not record:
         raise HTTPException(status_code=404, detail="Meeting not found.")
     if record["status"] != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Meeting is still {record['status']}. Chat available once processing completes."
-        )
+        return JSONResponse(status_code=202, content={"meeting_id": meeting_id, "status": record["status"]})
+    if "extraction" not in record:
+        raise HTTPException(status_code=404, detail="No insights found.")
 
-    session_id = request.session_id or str(uuid.uuid4())
+    if format == "markdown":
+        return JSONResponse(content={"meeting_id": meeting_id, "report": record["markdown_report"]})
 
+    return JSONResponse(content={"meeting_id": meeting_id, **record["extraction"]})
+
+
+@app.get("/meetings/{meeting_id}/action-items", tags=["insights"])
+async def get_action_items(meeting_id: str, owner: str | None = None):
+    """
+    Get action items. Optional filter: ?owner=Sarah
+    """
+    record = meeting_store.get(meeting_id)
+    if not record or record["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Meeting not found or not yet processed.")
+
+    items = record.get("extraction", {}).get("action_items", [])
+    if owner:
+        items = [a for a in items if owner.lower() in a.get("owner", "").lower()]
+
+    return {"meeting_id": meeting_id, "count": len(items), "action_items": items}
+
+
+@app.post("/meetings/{meeting_id}/chat", response_model=ChatResponse, tags=["chat"])
+async def chat_with_meeting(meeting_id: str, request: ChatRequest):
+    """Chat with the meeting agent in natural language."""
+    record = meeting_store.get(meeting_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Meeting not found.")
+    if record["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Meeting is still {record['status']}.")
+
+    session_id    = request.session_id or str(uuid.uuid4())
     response_text = await chat(
         meeting_id=meeting_id,
         session_id=session_id,
@@ -231,4 +241,4 @@ async def get_status(meeting_id: str):
 
 @app.get("/health", tags=["meta"])
 async def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "3.0.0"}
